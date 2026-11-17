@@ -469,21 +469,64 @@ function sseEvent(event: string | null, data: unknown): string {
   return `${event === null ? '' : `event: ${event}\n`}data: ${JSON.stringify(data)}\n\n`;
 }
 
-/** One SSE frame with every data payload's `model` rewritten to the id dialled. */
-function frameWithModel(frame: string, model: string): string {
-  const lines = frame.split('\n').map((line) => {
+/**
+ * One SSE frame with every data payload's `model` rewritten to the id dialled —
+ * and at most one finish in the whole stream. Some upstreams finish twice:
+ * NVIDIA's super-vl sends a stop chunk and then a usage chunk that ALSO
+ * carries finish_reason "stop", and a client that counts finish chunks rejects
+ * the replay as invalid. The first finish chunk keeps its reason; any later
+ * one keeps its usage but loses the reason, so it is no longer a finish
+ * chunk. A repeated [DONE] is dropped the same way. `state` is the stream's
+ * memory: it must survive across frames, however the chunk boundaries fall.
+ * Returns null when the frame has nothing left to emit.
+ */
+function frameWithModel(frame: string, model: string, state: { sawFinish: boolean; sawDone: boolean }): string | null {
+  const lines: string[] = [];
+  for (const line of frame.split('\n')) {
     const trimmed = line.trim();
-    if (!trimmed.startsWith('data:')) return line;
+    if (!trimmed.startsWith('data:')) {
+      lines.push(line);
+      continue;
+    }
     const payload = trimmed.slice(5).trim();
-    if (payload === '' || payload === '[DONE]') return line;
+    if (payload === '') {
+      lines.push(line);
+      continue;
+    }
+    if (payload === '[DONE]') {
+      if (state.sawDone) continue;
+      state.sawDone = true;
+      lines.push(line);
+      continue;
+    }
+    let chunk: unknown;
     try {
-      const chunk: unknown = JSON.parse(payload);
-      if (isRecord(chunk)) return `data: ${JSON.stringify({ ...chunk, model })}`;
+      chunk = JSON.parse(payload);
     } catch {
       // Not JSON: relay the line untouched.
+      lines.push(line);
+      continue;
     }
-    return line;
-  });
+    if (!isRecord(chunk)) {
+      lines.push(line);
+      continue;
+    }
+    const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
+    const choice = isRecord(choices[0]) ? choices[0] : null;
+    if (choice !== null && choice.finish_reason !== null && choice.finish_reason !== undefined) {
+      if (state.sawFinish) {
+        // A second finish: keep the frame (its usage survives) but strip the
+        // reason, so the replayed stream has exactly one finish chunk.
+        const rest = { ...choice, finish_reason: null };
+        if ('native_finish_reason' in choice) rest.native_finish_reason = null;
+        lines.push(`data: ${JSON.stringify({ ...chunk, model, choices: [rest, ...choices.slice(1)] })}`);
+        continue;
+      }
+      state.sawFinish = true;
+    }
+    lines.push(`data: ${JSON.stringify({ ...chunk, model })}`);
+  }
+  if (lines.length === 0) return null;
   return `${lines.join('\n')}\n\n`;
 }
 
@@ -500,13 +543,17 @@ function streamOfText(text: string): ReadableStream<Uint8Array> {
 
 /**
  * A Chat Completions SSE stream as it came, frame by frame, every data payload's
- * `model` the id dialled. Frames end on a blank line; a frame split across reads
- * is held until its end arrives.
+ * `model` the id dialled — and exactly one finish chunk in the replay, however
+ * the upstream chunked its ending. Frames end on a blank line; a frame split
+ * across reads is held until its end arrives.
  */
 async function* openAIStreamWithModel(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
   const reader = upstream.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
+  // One finish per stream, however the upstream chunked it: the dedupe state
+  // lives for the whole stream, not one frame.
+  const finishState = { sawFinish: false, sawDone: false };
   try {
     for (;;) {
       const { value, done } = await reader.read();
@@ -516,12 +563,16 @@ async function* openAIStreamWithModel(upstream: ReadableStream<Uint8Array>, mode
       while (at !== -1) {
         const frame = buffer.slice(0, at);
         buffer = buffer.slice(at + 2);
-        yield frameWithModel(frame, model);
+        const cleaned = frameWithModel(frame, model, finishState);
+        if (cleaned !== null) yield cleaned;
         at = buffer.indexOf('\n\n');
       }
     }
     buffer += decoder.decode();
-    if (buffer.trim() !== '') yield frameWithModel(buffer, model);
+    if (buffer.trim() !== '') {
+      const cleaned = frameWithModel(buffer, model, finishState);
+      if (cleaned !== null) yield cleaned;
+    }
   } finally {
     reader.releaseLock();
   }
